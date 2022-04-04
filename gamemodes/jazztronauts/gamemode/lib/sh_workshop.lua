@@ -1,5 +1,10 @@
 AddCSLuaFile()
 
+-- We will need this for the new UGC files.
+if SERVER then
+	pcall(require, "workshop")
+end
+
 module( 'workshop', package.seeall )
 
 local function tagdepth(str)
@@ -160,6 +165,7 @@ end
 -- Identical to steamworks.FileInfo, but works on servers too
 function FileInfo(itemid, func)
 	local body = { ["itemcount"] = "1", ["publishedfileids[0]"] = tostring(itemid)}
+
 	http.Post("http://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v0001/", body,
 		function(resp, len, head, status)
 			print("Published file details received...")
@@ -178,7 +184,6 @@ function FileInfo(itemid, func)
 			func(nil, errmsg)
 		end
 	)
-
 end
 
 -- Given a workshop id, download the raw GMA file, returning the compressed binary string
@@ -198,40 +203,27 @@ function DownloadExtractGMA(wsid, path, func)
 	end )
 end
 
-local WORKSHOP_CACHE_PATH = "jazztronauts/cache"
+local WORKSHOP_CACHE_PATH = "cache/srcds"
 
 function ExtractGMA(path, data)
-	-- Decompress (LZMA), then write
-	local start = SysTime()
-	local decompd = util.Decompress(data)
-	data = (decompd and #decompd > 0) and decompd or data
-	print("Decompress: " .. (SysTime() - start) .. " seconds")
-
-	-- Write to disk
-	print("Writing to " .. path)
-	start = SysTime()
-	file.CreateDir(WORKSHOP_CACHE_PATH)
-	file.Write(path, data)
-	print("Write to disk: " .. (SysTime() - start) .. " seconds")
-
 	-- Read file contents
 	start = SysTime()
-	local fileList = gmad.FileList("data/" .. path)
+	local fileList = gmad.FileList(path)
 	print("Reading file list: " .. (SysTime() - start) .. " seconds")
 
 	return fileList
 end
 
 function ClearCache()
-	local files = file.Find(WORKSHOP_CACHE_PATH .. "/*", "DATA")
+	local files = file.Find(WORKSHOP_CACHE_PATH .. "/*", "MOD")
 	for _, v in pairs(files) do
 		file.Delete(WORKSHOP_CACHE_PATH .. "/" .. v)
 	end
 end
 
 function IsAddonCached(wsid)
-	local cachepath = WORKSHOP_CACHE_PATH .. "/" .. wsid .. ".dat"
-	return file.Exists(cachepath, "DATA") and "data/" .. cachepath
+	local cachepath = WORKSHOP_CACHE_PATH .. "/" .. wsid .. ".gma"
+	return file.Exists(cachepath, "MOD") and cachepath
 end
 
 
@@ -299,43 +291,13 @@ end
 -- Works on both server and client, but only for old-style workshop addons (non-UGC items)
 local function DownloadGMA_Dedicated(wsid, func, decompress_func)
 	-- Callback for when the actual GMA file is downloaded
-	local function FileDownloaded(body, size, headers, status)
+	local function FileDownloaded(addon, size)
 		print("Downloaded " ..  size .. " bytes!")
-		local cachepath = WORKSHOP_CACHE_PATH .. "/" .. wsid .. ".dat"
 
-		-- Optionally, delay before decompressing if the decompress function told us to
+		local path = WORKSHOP_CACHE_PATH .. "/" .. addon .. ".gma"
 		local delay = decompress_func and decompress_func(wsid) or 0
 		timer.Simple(delay, function()
-
-			-- Decompress and save to cache folder
-			workshop.ExtractGMA(cachepath, body)
-
-			func("data/" .. cachepath)
-		end )
-	end
-
-	-- Callback for when we've received information about a specific published file
-	local function OnGetPublishedFileDetails(resp, len, head, status)
-		print("Published file details received...")
-		local json = util.JSONToTable(resp)
-		local addoninfo = tryGetValue(json, "response", "publishedfiledetails", 1)
-		local fileurl = addoninfo and addoninfo.file_url
-
-		if not fileurl then
-			print("Received response from GetPublishedFileDetails, but missing file_url: " .. resp)
-			func(nil, "Received response from GetPublishedFileDetails, but missing file_url. File hidden?")
-			return
-		end
-
-		if #fileurl == 0 then
-			func(nil, "Specified addon uses the new UGC workshop system, which is not compatible") -- New UGC workshop addons are not supported with this method
-			return
-		end
-
-		print("Beginning file download... " .. fileurl)
-		http.Fetch(fileurl, FileDownloaded,
-		function(errormsg)
-			func(nil, "Download file failed: " ..  errormsg)
+			func(path)
 		end)
 	end
 
@@ -344,23 +306,27 @@ local function DownloadGMA_Dedicated(wsid, func, decompress_func)
 		print("Collection details received...")
 		-- Grab published fileid from collection details
 		local json = util.JSONToTable(resp)
-		local fileid = tryGetValue(json, "response", "collectiondetails", 1, "publishedfileid")
+		local addon_id = tryGetValue(json, "response", "collectiondetails", 1, "publishedfileid")
 
-		if not fileid then
+		if not addon_id then
 			print("Received response from GetCollectionDetails, but missing fileid: " .. resp)
 			func(nil, "Received response from GetCollectionDetails, but missing fileid")
 			return
 		end
 
-		local body = { ["itemcount"] = "1", ["publishedfileids[0]"] = fileid}
-		http.Post("http://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v0001/", body,
-			OnGetPublishedFileDetails,
-			function(errmsg)
-				func(nil, "GetPublishedFileDetails request failed: " .. errmsg)
-			end
-		)
+		-- Check if the module is included.
+		if steamworks and steamworks.DownloadUGC then
+			steamworks.DownloadUGC(addon_id, function(path, file)
+				if path and file then
+					FileDownloaded(addon_id, file:Size())
+				else
+					func(nil, "Download file failed: Unsuccessful")
+				end
+			end)
+		else
+			func(nil, "Missing steamworks module, tell server owner to install: https://github.com/WilliamVenner/gmsv_workshop")
+		end
 	end
-
 
 	-- Use cached file if it exists on disk
 	local existfile = IsAddonCached(wsid)
@@ -383,7 +349,6 @@ end
 -- Given a workshop id, download the raw GMA file to disk
 function DownloadGMA(wsid, func, decompress_func)
 	-- Before doing anything, see if the addon is already mounted locally, that saves us all the work
-
 	local subscribed = engine.GetAddons()
 	for _, v in pairs(subscribed) do
 		print(type(v.wsid), type(wsid), v.wsid == wsid)
@@ -397,8 +362,6 @@ function DownloadGMA(wsid, func, decompress_func)
 			break -- If we hit a match and it wasn't mounted, fallback
 		end
 	end
-
-
 
 	-- Prefer using the dedicated server way, because for old addons there is always a hitch on decompress
 	-- We have explicit control over this hitch since we decompress manually, so we can throw the little UI widget up to hide it
